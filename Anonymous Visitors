@@ -1,0 +1,54 @@
+SET ansi_mode = false;
+
+WITH
+
+/* ─────────────────────────────────────────────────────────────────────
+   Anonymous visitors: no amg_id at all (truly unidentified).
+   Uses domain_userid (Snowplow first-party cookie) as the visitor key.
+   Last 3 rolling calendar months.
+   ───────────────────────────────────────────────────────────────────── */
+bot_sessions AS (
+  SELECT domain_sessionid, is_bot_traffic
+  FROM gold_us_prod.user_events.bot_sessions
+  WHERE start_tstamp_date >= ADD_MONTHS(DATE_TRUNC('month', CURRENT_DATE), -3)
+),
+
+web_anon AS (
+  SELECT
+    wpv.domain_userid                                                                   AS visitor_id,
+    wpv.start_tstamp_date                                                                AS visit_date,
+    'web'                                                                                AS source,
+    wpv.user.amgid                                                                       AS amg_id,
+    wpv.user.amg_id_stitched                                                             AS amg_id_stitched,
+    concat(wpv.domain_sessionid,
+           concat(wpv.PAGE.url_scheme, '://', wpv.PAGE.url_host, wpv.PAGE.url_path))    AS upvid
+  FROM gold_us_prod.spruce.gld_web_page_views wpv
+  LEFT JOIN bot_sessions bs ON bs.domain_sessionid = wpv.domain_sessionid
+  WHERE wpv.start_tstamp_date >= ADD_MONTHS(DATE_TRUNC('month', CURRENT_DATE), -3)
+    AND wpv.start_tstamp_date <  CURRENT_DATE
+    AND wpv.app_id             IN ('the-new-yorker', 'the-new-yorker-app')
+    AND COALESCE(wpv.user.amg_id_stitched, wpv.user.amgid) IS NULL
+    AND isnotnull(wpv.domain_userid)
+    AND (bs.is_bot_traffic IS FALSE OR bs.is_bot_traffic IS NULL)
+    -- Exclude paid traffic
+    AND lower(wpv.page.url_full) NOT LIKE '%utm_medium=display%'
+    AND lower(wpv.page.url_full) NOT LIKE '%utm_medium=cpc%'
+    AND lower(wpv.page.url_full) NOT LIKE '%utm_campaign=paid%'
+    AND lower(wpv.page.url_full) NOT LIKE '%utm_social-type=paid%'
+    AND lower(wpv.page.url_full) NOT LIKE '%utm_campaign=cm_paid%'
+    AND lower(wpv.page.url_full) NOT LIKE '%utm_campaign=fbig_direct%'
+    AND lower(wpv.page.url_full) NOT LIKE '%utm_campaign=domestic_prospecting%'
+    AND lower(wpv.page.url_full) NOT LIKE 'source=paid%'
+    AND lower(wpv.page.url_full) NOT LIKE 'utm_source=jg'
+)
+
+SELECT
+  visit_date,
+  'anonymous'              AS entitlement_status,
+  source,
+  amg_id                   AS amgid,
+  MAX(amg_id_stitched)     AS amgid_stitched,
+  upvid
+FROM web_anon
+GROUP BY visit_date, source, amg_id, upvid
+ORDER BY visit_date;
