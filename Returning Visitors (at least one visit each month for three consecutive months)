@@ -1,0 +1,138 @@
+WITH map AS (
+  SELECT *
+  FROM user_tables.aud_analytics.lkp_property_mapping
+),
+
+-- Suppress active NYR subscribers (logged-in, identified users only).
+-- Returns both domain_userid (web suppression) and amg_user_id (mobile suppression).
+-- Join chain: analytics_identity_map -> d_email_extd -> f_consumer_subscription_martech
+-- Adjust sub_status values as needed.
+active_subscribers AS (
+  SELECT DISTINCT
+    aim.domain_userid,
+    aim.amg_user_id
+  FROM gold_us_prod.spruce.analytics_identity_map aim
+  INNER JOIN gold_us_prod.consumer_dw.d_email_extd ext
+    ON aim.amg_user_id = ext.amg_uuid
+  INNER JOIN gold_us_prod.consumer_dw.f_consumer_subscription_martech sub
+    ON sub.consumer_profile_key = ext.email_md5_hash
+   AND sub.brand_cd = 'NYR'
+   AND sub.sub_status IN ('active', 'in_trial', 'non_renewing')
+  WHERE aim.brand = 'The New Yorker'
+    AND aim.domain_userid IS NOT NULL
+    AND aim.amg_user_id IS NOT NULL
+),
+
+base AS (
+  -- Web page views: domain_userid as user key
+  SELECT
+    app_id,
+    start_tstamp_date                        AS visit_date,
+    DATE_TRUNC('month', start_tstamp_date)   AS month,
+    'web'                                    AS source,
+    domain_userid                            AS user_id,
+    user.amgid                               AS amg_id,
+    user.amg_id_stitched                     AS amg_id_stitched,
+    CASE WHEN user.amgid IS NOT NULL THEN 'registered' ELSE 'anonymous' END AS entitlement_status
+  FROM gold_us_prod.spruce.gld_web_page_views
+  WHERE domain_userid IS NOT NULL
+    AND app_id IN ('the-new-yorker', 'the-new-yorker-app')
+    AND user.amgid IS NULL
+    AND NOT (
+      lower(session.marketing_source) like '%jg%' 
+      OR lower(session.marketing_source) like '%display%' 
+      OR lower(session.marketing_medium) like '%display%'
+      OR LOWER(session.marketing_campaign) LIKE 'paid%'
+      OR LOWER(session.marketing_campaign) LIKE '%paid-revops%'
+      OR LOWER(session.marketing_campaign) LIKE 'tin_%'
+      OR LOWER(session.marketing_medium) LIKE 'paid%'
+      OR LOWER(session.referer_url_query) LIKE '%boosted%'
+      OR LOWER(session.referer_url_query) LIKE '%facebook-citizennet%'
+      OR LOWER(session.marketing_medium) LIKE 'cpc%'
+    )
+    AND domain_userid NOT IN (
+      SELECT domain_userid FROM active_subscribers
+    )
+
+  UNION ALL
+
+  -- Mobile native app screen views: user.user_id as user key
+  -- screen_engaged_time_in_s maps to total; no web-page equivalent so page_engaged_time_in_s is NULL.
+  -- Subscriber suppression via user.amg_id -> amg_user_id (logged-in users only).
+  SELECT
+    app_id,
+    derived_tstamp_date                      AS visit_date,
+    DATE_TRUNC('month', derived_tstamp_date) AS month,
+    'mobile'                                 AS source,
+    user.user_id                              AS user_id,
+    user.amg_id                               AS amg_id,
+    CAST(NULL AS STRING)                       AS amg_id_stitched,
+    CASE WHEN user.amg_id IS NOT NULL THEN 'registered' ELSE 'anonymous' END AS entitlement_status
+  FROM gold_us_prod.spruce.gld_mobile_screen_views
+  WHERE app_id = 'the-new-yorker-app'
+    AND user.user_id IS NOT NULL
+    AND NOT (
+      traffic.source_channel_group IN ('Paid Social', 'Paid Search')
+      OR LOWER(traffic.marketing_campaign) LIKE 'paid%'
+      OR LOWER(traffic.referrer_medium) LIKE '%display%'
+    )
+    AND user.amg_id IS NULL
+),
+
+-- One row per user per month they were active, per app_id
+user_months_visited AS (
+  SELECT DISTINCT
+    app_id,
+    user_id,
+    month
+  FROM base
+),
+
+-- Users who visited in the current month AND the two immediately prior months
+-- i.e. a 3-consecutive-month streak ending in "month"
+returning_3mo AS (
+  SELECT
+    cur.app_id,
+    cur.user_id,
+    cur.month
+  FROM user_months_visited cur
+  INNER JOIN user_months_visited m1
+    ON m1.app_id = cur.app_id
+   AND m1.user_id = cur.user_id
+   AND m1.month = DATEADD(month, -1, cur.month)
+  INNER JOIN user_months_visited m2
+    ON m2.app_id = cur.app_id
+   AND m2.user_id = cur.user_id
+   AND m2.month = DATEADD(month, -2, cur.month)
+),
+
+agg AS (
+  SELECT
+    b.app_id,
+    b.visit_date,
+    b.user_id,
+    b.entitlement_status,
+    b.source,
+    b.amg_id                              AS amgid,
+    MAX(b.amg_id_stitched)                AS amgid_stitched
+
+  FROM base b
+  INNER JOIN returning_3mo r
+    ON r.app_id = b.app_id
+   AND r.user_id = b.user_id
+   AND r.month = b.month
+
+  GROUP BY b.app_id, b.visit_date, b.user_id, b.entitlement_status, b.source, b.amg_id
+)
+
+SELECT
+  a.visit_date,
+  a.user_id,
+  a.entitlement_status,
+  a.source,
+  a.amgid,
+  a.amgid_stitched
+FROM agg a
+JOIN map m
+  ON m.app_id = a.app_id
+ORDER BY m.app_id, a.visit_date
