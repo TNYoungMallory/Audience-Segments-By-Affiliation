@@ -94,11 +94,11 @@ unagg AS (
   LEFT JOIN known_map km ON pvs.amg_id = km.amg_id
 )
 SELECT
+  MAX(visit_date) AS last_visit_date
   entitlement_status,
   source,
   amg_id AS amgid,
-  MAX(amg_id_stitched) AS amgid_stitched,
-  MAX(visit_date) AS last_visit_date
+  MAX(amg_id_stitched) AS amgid_stitched
 FROM unagg
 WHERE entitlement_status <> 'not former subscriber'
 GROUP BY ALL
