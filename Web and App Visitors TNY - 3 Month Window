@@ -1,0 +1,223 @@
+SET ansi_mode = false;
+
+WITH
+
+/* ─────────────────────────────────────────────────────────────────────
+   1.  Raw events — last 3 rolling calendar months, identified users only
+       Single scan per table; visit-date CTEs are derived from these.
+       Adjust the ADD_MONTHS offset to widen / narrow the detection window.
+   ───────────────────────────────────────────────────────────────────── */
+web_raw AS (
+  SELECT
+    COALESCE(user.amg_id_stitched, user.amgid)                          AS amg_id,
+    start_tstamp_date                                                    AS visit_date,
+    user.amg_id_stitched                                                AS amg_id_stitched,
+    concat(domain_sessionid,
+           concat(PAGE.url_scheme, '://', PAGE.url_host, PAGE.url_path)) AS upvid,
+    'web'                                                                AS source
+  FROM gold_us_prod.spruce.gld_web_page_views
+  WHERE start_tstamp_date >= ADD_MONTHS(DATE_TRUNC('month', CURRENT_DATE), -3)
+    AND start_tstamp_date <  CURRENT_DATE
+    AND app_id             IN ('the-new-yorker', 'the-new-yorker-app')
+    AND COALESCE(user.amg_id_stitched, user.amgid) IS NOT NULL
+    AND isnotnull(domain_userid)
+),
+
+web_visits AS (
+  SELECT DISTINCT amg_id, visit_date FROM web_raw
+),
+
+mobile_raw AS (
+  SELECT
+    user.amg_id                        AS amg_id,
+    derived_tstamp_date                AS visit_date,
+    NULL                               AS amg_id_stitched,
+    screen_view_id                     AS upvid,
+    'mobile'                           AS source
+  FROM gold_us_prod.spruce.gld_mobile_screen_views
+  WHERE derived_tstamp_date >= ADD_MONTHS(DATE_TRUNC('month', CURRENT_DATE), -3)
+    AND derived_tstamp_date <  CURRENT_DATE
+    AND app_id = 'the-new-yorker-app'
+    AND isnotnull(user.amg_id)
+),
+
+mobile_visits AS (
+  SELECT DISTINCT amg_id, visit_date FROM mobile_raw
+),
+
+/* ─────────────────────────────────────────────────────────────────────
+   2.  Cross-platform users: amg_id seen on BOTH web AND mobile app
+   ───────────────────────────────────────────────────────────────────── */
+cross_platform AS (
+  SELECT DISTINCT w.amg_id
+  FROM      web_visits    w
+  INNER JOIN mobile_visits m ON w.amg_id = m.amg_id
+),
+
+/* ─────────────────────────────────────────────────────────────────────
+   3.  Returning visitor: visited in each of the 3 COMPLETE calendar
+       months before the current month (combined web + mobile activity)
+       e.g. on 2026-07-15 → must have visited in Apr, May, AND Jun
+   ───────────────────────────────────────────────────────────────────── */
+combined_visits AS (
+  SELECT amg_id, visit_date FROM web_visits
+  UNION ALL
+  SELECT amg_id, visit_date FROM mobile_visits
+),
+
+returning_visitors AS (
+  SELECT amg_id
+  FROM combined_visits
+  WHERE visit_date >= ADD_MONTHS(DATE_TRUNC('month', CURRENT_DATE), -3)
+    AND visit_date <  DATE_TRUNC('month', CURRENT_DATE)
+  GROUP BY amg_id
+  HAVING COUNT(DISTINCT DATE_TRUNC('month', visit_date)) >= 3
+),
+
+/* ─────────────────────────────────────────────────────────────────────
+   4.  Identity bridge: amg_id  →  email_md5_hash
+   ───────────────────────────────────────────────────────────────────── */
+email_map AS (
+  SELECT DISTINCT amg_uuid AS amg_id, email_md5_hash
+  FROM gold_us_prod.consumer_dw.d_email_extd
+  WHERE amg_uuid        IS NOT NULL
+    AND email_md5_hash  IS NOT NULL
+),
+
+/* ─────────────────────────────────────────────────────────────────────
+   5.  Subscription records — CDS (print / legacy digital)
+   ───────────────────────────────────────────────────────────────────── */
+cds_subs AS (
+  SELECT
+    email_md5_hash,
+    -- latest active day: use explicit cancel date if present, otherwise term expiry
+    CAST(COALESCE(cancel_dt, order_expire_dt) AS DATE) AS sub_last_active_dt,
+    FALSE                                               AS is_trial,
+    ROW_NUMBER() OVER (
+      PARTITION BY email_md5_hash, magazine_abbr, order_expire_dt
+      ORDER BY order_nbr DESC
+    ) AS rn
+  FROM gold_us_prod.consumer_dw.f_consumer_subscription_cds
+  WHERE brand_cd IN ('NYR', 'NYR3')
+),
+
+/* ─────────────────────────────────────────────────────────────────────
+   6.  Subscription records — Martech / Chargebee (digital / all-access)
+   ───────────────────────────────────────────────────────────────────── */
+martech_subs AS (
+  SELECT
+    email_md5_hash,
+    -- NULL cancelled_dt means subscription is still active → use today as sentinel
+    CAST(IFNULL(sub_cancelled_dt, CURRENT_TIMESTAMP) AS DATE) AS sub_last_active_dt,
+    CASE
+      WHEN trial_start_dt IS NOT NULL
+        AND CAST(trial_end_dt AS DATE) >= CURRENT_DATE THEN TRUE
+      ELSE FALSE
+    END AS is_trial
+  FROM gold_us_prod.consumer_dw.f_consumer_subscription_martech
+  WHERE core_brand_cd IN ('TNY', 'NYR')
+),
+
+all_subs AS (
+  SELECT email_md5_hash, sub_last_active_dt, is_trial FROM cds_subs     WHERE rn = 1
+  UNION ALL
+  SELECT email_md5_hash, sub_last_active_dt, is_trial FROM martech_subs
+),
+
+/* ─────────────────────────────────────────────────────────────────────
+   7.  Current subscription state per email
+       is_active  = 1  →  at least one subscription still running today
+       is_in_trial= 1  →  active AND in a trial period
+       last_expired_dt →  most recent lapse date (for lapsed-bucket calc)
+   ───────────────────────────────────────────────────────────────────── */
+sub_summary AS (
+  SELECT
+    email_md5_hash,
+    MAX(CASE WHEN sub_last_active_dt >= CURRENT_DATE                         THEN 1 ELSE 0 END) AS is_active,
+    MAX(CASE WHEN sub_last_active_dt >= CURRENT_DATE AND is_trial = TRUE     THEN 1 ELSE 0 END) AS is_in_trial,
+    MAX(CASE WHEN sub_last_active_dt <  CURRENT_DATE THEN sub_last_active_dt END)               AS last_expired_dt
+  FROM all_subs
+  GROUP BY email_md5_hash
+),
+
+/* ─────────────────────────────────────────────────────────────────────
+   8.  Per-user profile — join identity, subscription, and behaviour
+   ───────────────────────────────────────────────────────────────────── */
+user_profile AS (
+  SELECT
+    cp.amg_id,
+    em.email_md5_hash,
+    ss.is_active,
+    ss.is_in_trial,
+    -- days since most recent lapse (NULL for active subscribers)
+    CASE
+      WHEN ss.is_active = 0 OR ss.is_active IS NULL
+      THEN DATEDIFF(CURRENT_DATE, ss.last_expired_dt)
+    END                                                       AS days_since_expired,
+    CASE WHEN rv.amg_id IS NOT NULL THEN TRUE ELSE FALSE END  AS is_returning_visitor
+  FROM cross_platform  cp
+  LEFT JOIN email_map          em  ON cp.amg_id        = em.amg_id
+  LEFT JOIN sub_summary        ss  ON em.email_md5_hash = ss.email_md5_hash
+  LEFT JOIN returning_visitors rv  ON cp.amg_id        = rv.amg_id
+QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY cp.amg_id
+    ORDER BY
+      ss.is_active      DESC NULLS LAST,
+      ss.is_in_trial    DESC NULLS LAST,
+      ss.last_expired_dt DESC NULLS LAST
+  ) = 1
+),
+
+/* ─────────────────────────────────────────────────────────────────────
+   9.  Entitlement classification — priority order:
+         1  Subscriber in Trial       (active + within trial window)
+         2  Subscriber                (active, paid)
+         3  Returning Visitor         (3-month rolling, no active sub)
+         4  Former Sub — Lapsed ≤3 mo (expired ≤90 days ago)
+         5  Former Sub — Lapsed >3 mo (expired >90 days ago)
+         6  Logged In Prospect        (has email in our system, no sub record)
+         7  Anonymous                 (amg_id not linked to email — unresolvable)
+   ───────────────────────────────────────────────────────────────────── */
+classified AS (
+  SELECT
+    amg_id,
+    CASE
+      WHEN is_active = 1 AND is_in_trial = 1                              THEN 'Subscriber in Trial'
+      WHEN is_active = 1                                                  THEN 'Subscriber'
+      WHEN is_returning_visitor = TRUE AND (is_active = 0 OR is_active IS NULL) THEN 'Returning Visitor'
+      WHEN days_since_expired <= 90                                        THEN 'Former Subscriber — Lapsed <=3 Months'
+      WHEN days_since_expired  > 90                                        THEN 'Former Subscriber — Lapsed >3 Months'
+      WHEN email_md5_hash IS NOT NULL                                      THEN 'Logged In Prospect'
+      ELSE                                                                      'Anonymous'
+    END AS entitlement,
+    CASE
+      WHEN is_active = 1 AND is_in_trial = 1                              THEN 1
+      WHEN is_active = 1                                                  THEN 2
+      WHEN is_returning_visitor = TRUE AND (is_active = 0 OR is_active IS NULL) THEN 3
+      WHEN days_since_expired <= 90                                        THEN 4
+      WHEN days_since_expired  > 90                                        THEN 5
+      WHEN email_md5_hash IS NOT NULL                                      THEN 6
+      ELSE                                                                      7
+    END AS sort_order
+  FROM user_profile
+)
+
+/* ─────────────────────────────────────────────────────────────────────
+   Final output: cross-platform users by entitlement
+   Remove the GROUP BY and change SELECT to `amg_id, entitlement`
+   if you need the individual user list instead of the summary.
+   ───────────────────────────────────────────────────────────────────── */
+SELECT
+  rv.visit_date,
+  c.entitlement AS entitlement_status,
+  rv.source,
+  rv.amg_id AS amgid,
+  MAX(rv.amg_id_stitched) AS amgid_stitched,
+  rv.upvid
+FROM classified c
+INNER JOIN (
+  SELECT amg_id, visit_date, source, amg_id_stitched, upvid FROM web_raw
+  UNION ALL
+  SELECT amg_id, visit_date, source, amg_id_stitched, upvid FROM mobile_raw
+) rv ON c.amg_id = rv.amg_id
+GROUP BY ALL;
