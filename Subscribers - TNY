@@ -1,0 +1,125 @@
+SET
+  ansi_mode = false;
+
+WITH cds AS (
+    SELECT
+      core_brand_cd,
+      email_md5_hash,
+      order_expire_dt AS subscription_last_active_day,
+      cancel_dt AS cancel_last_active_day,
+      rank() over (
+        PARTITION by email_md5_hash,
+        magazine_abbr,
+        order_expire_dt
+        ORDER BY
+          order_nbr DESC
+      ) AS order_count
+    FROM
+      gold_us_prod.consumer_dw.f_consumer_subscription_cds
+    WHERE brand_cd IN ('NYR', 'NYR3')
+  ),
+  single_subs AS (
+    SELECT
+      core_brand_cd,
+      email_md5_hash,
+      CASE
+        WHEN isnull(cancel_last_active_day) THEN subscription_last_active_day
+        ELSE cancel_last_active_day
+      END AS subscription_last_active_dt
+    FROM
+      cds
+    WHERE
+      order_count = 1
+      AND isnull(cancel_last_active_day)
+      AND subscription_last_active_day >= current_date
+    UNION ALL
+    SELECT
+      'NYR' AS core_brand_cd,
+      email_md5_hash,
+      IFNULL(sub_cancelled_dt, current_date) AS subscription_last_active_dt
+    FROM
+      gold_us_prod.consumer_dw.f_consumer_subscription_martech
+    WHERE
+      core_brand_cd IN ('TNY', 'NYR')
+      AND sub_cancelled_dt IS NULL
+  ),
+  cglemails AS (
+    SELECT
+      ext.amg_uuid AS amg_id,
+      ext.email_md5_hash
+    FROM
+      gold_us_prod.consumer_dw.d_email_extd ext
+    WHERE
+      ext.amg_uuid IS NOT NULL
+      AND ext.email_md5_hash IS NOT NULL
+  ),
+  known_map AS (
+    SELECT
+      c.amg_id,
+      MAX(s.subscription_last_active_dt) AS subscription_last_active_dt
+    FROM
+      cglemails c
+      LEFT JOIN single_subs s ON c.email_md5_hash = s.email_md5_hash
+    GROUP BY
+      c.amg_id
+  ),
+  pvs AS (
+    -- Web page views (last 3 days)
+    SELECT
+      start_tstamp_date AS visit_date,
+      COALESCE(user.amg_id_stitched, user.amgid) AS amg_id,
+      user.amg_id_stitched AS amg_id_stitched,
+      concat(domain_sessionid, concat(PAGE.url_scheme, '://', PAGE.url_host, PAGE.url_path)) AS upvid,
+      'web' AS source
+    FROM
+      gold_us_prod.spruce.gld_web_page_views
+    WHERE
+      start_tstamp_date BETWEEN current_date - 3 AND dateadd(current_date, -1)
+      AND app_id IN ('the-new-yorker', 'the-new-yorker-app')
+      AND isnotnull(COALESCE(user.amg_id_stitched, user.amgid))
+      AND isnotnull(domain_userid)
+
+    UNION ALL
+
+    -- Mobile screen views (last 3 days)
+    SELECT
+      derived_tstamp_date AS visit_date,
+      user.amg_id AS amg_id,
+      NULL AS amg_id_stitched,
+      screen_view_id AS upvid,
+      'mobile' AS source
+    FROM
+      gold_us_prod.spruce.gld_mobile_screen_views
+    WHERE
+      derived_tstamp_date BETWEEN current_date - 3 AND dateadd(current_date, -1)
+      AND app_id = 'the-new-yorker-app'
+      AND isnotnull(user.amg_id)
+  ),
+  unagg AS (
+    SELECT
+      visit_date,
+      pvs.amg_id,
+      pvs.amg_id_stitched,
+      pvs.source,
+      pvs.upvid,
+      CASE
+        WHEN subscription_last_active_dt IS NOT NULL THEN 'current subscriber'
+        ELSE 'not subscriber'
+      END AS entitlement_status
+    FROM
+      pvs
+      LEFT JOIN known_map km ON pvs.amg_id = km.amg_id
+  )
+SELECT
+  visit_date,
+  'current subscriber' AS entitlement_status,
+  source,
+  amg_id AS amgid,
+  MAX(amg_id_stitched) AS amgid_stitched,
+  upvid
+FROM
+  unagg
+WHERE
+  entitlement_status = 'current subscriber'
+GROUP BY
+  ALL
