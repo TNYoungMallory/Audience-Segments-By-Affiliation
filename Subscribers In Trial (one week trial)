@@ -42,19 +42,7 @@ pvs AS (
     start_tstamp_date AS visit_date,
     COALESCE(user.amg_id_stitched, user.amgid) AS amg_id,
     user.amg_id_stitched AS amg_id_stitched,
-    concat(
-      domain_sessionid,
-      concat(
-        PAGE.url_scheme,
-        '://',
-        PAGE.url_host,
-        PAGE.url_path
-      )
-    ) AS upvid,
-    total_engaged_time_in_s,
-    page_engaged_time_in_s,
-    audio_engaged_time_in_s,
-    video_engaged_time_in_s,
+    user.xid AS xid,
     'web' AS source
   FROM
     gold_us_prod.spruce.gld_web_page_views
@@ -71,11 +59,7 @@ pvs AS (
     derived_tstamp_date AS visit_date,
     user.amg_id AS amg_id,
     NULL AS amg_id_stitched,
-    screen_view_id AS upvid,
-    screen_engaged_time_in_s AS total_engaged_time_in_s,
-    screen_engaged_time_in_s AS page_engaged_time_in_s,
-    audio_engaged_time_in_s,
-    video_engaged_time_in_s,
+    NULL AS xid,
     'mobile' AS source
   FROM
     gold_us_prod.spruce.gld_mobile_screen_views
@@ -90,8 +74,8 @@ unagg AS (
     pvs.visit_date,
     pvs.amg_id,
     pvs.amg_id_stitched,
-    pvs.source,
-    pvs.upvid
+    pvs.xid,
+    pvs.source
   FROM
     pvs
     INNER JOIN trial_map tm
@@ -104,8 +88,8 @@ SELECT
   'in trial' AS entitlement_status,
   source,
   amg_id AS amgid,
-  MAX(amg_id_stitched) AS amgid_stitched,
-  upvid
+  amg_id_stitched AS amgid_stitched,
+  xid
 FROM
   unagg
 GROUP BY
