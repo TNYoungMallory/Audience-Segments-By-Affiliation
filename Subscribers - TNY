@@ -69,7 +69,7 @@ WITH cds AS (
       start_tstamp_date AS visit_date,
       COALESCE(user.amg_id_stitched, user.amgid) AS amg_id,
       user.amg_id_stitched AS amg_id_stitched,
-      concat(domain_sessionid, concat(PAGE.url_scheme, '://', PAGE.url_host, PAGE.url_path)) AS upvid,
+      user.xid AS xid,
       'web' AS source
     FROM
       gold_us_prod.spruce.gld_web_page_views
@@ -86,7 +86,7 @@ WITH cds AS (
       derived_tstamp_date AS visit_date,
       user.amg_id AS amg_id,
       NULL AS amg_id_stitched,
-      screen_view_id AS upvid,
+      NULL AS xid,
       'mobile' AS source
     FROM
       gold_us_prod.spruce.gld_mobile_screen_views
@@ -100,8 +100,8 @@ WITH cds AS (
       visit_date,
       pvs.amg_id,
       pvs.amg_id_stitched,
+      pvs.xid,
       pvs.source,
-      pvs.upvid,
       CASE
         WHEN subscription_last_active_dt IS NOT NULL THEN 'current subscriber'
         ELSE 'not subscriber'
@@ -115,10 +115,14 @@ SELECT
   'current subscriber' AS entitlement_status,
   source,
   amg_id AS amgid,
-  MAX(amg_id_stitched) AS amgid_stitched,
-  upvid
+  amg_id_stitched AS amgid_stitched,
+  xid
 FROM
   unagg
+WHERE
+  entitlement_status = 'current subscriber'
+GROUP BY
+  ALL
 WHERE
   entitlement_status = 'current subscriber'
 GROUP BY
