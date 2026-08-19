@@ -18,7 +18,7 @@ CREATE TABLE IF NOT EXISTS gold_us_prod.area_shared_analytics.subscribers_tny (
 
 
 -- ============================================================
--- STEP 2: Build the current active subscriber universe
+-- STEP 2: Build current active subscriber universe
 -- ============================================================
 
 CREATE OR REPLACE TEMP VIEW current_subscribers AS
@@ -26,11 +26,8 @@ CREATE OR REPLACE TEMP VIEW current_subscribers AS
 WITH cds AS (
 
     SELECT
-
       email_md5_hash,
-
       order_expire_dt AS subscription_last_active_day,
-
       cancel_dt AS cancel_last_active_day,
 
       RANK() OVER (
@@ -63,32 +60,21 @@ active_subs AS (
 
     WHERE core_brand_cd IN ('TNY', 'NYR')
       AND sub_cancelled_dt IS NULL
-),
-
-subscriber_ids AS (
-
-    SELECT DISTINCT
-      ext.amg_uuid AS amgid
-
-    FROM gold_us_prod.consumer_dw.d_email_extd ext
-
-    INNER JOIN active_subs s
-      ON ext.email_md5_hash = s.email_md5_hash
-
-    WHERE ext.amg_uuid IS NOT NULL
 )
 
-SELECT
-  amgid
+SELECT DISTINCT
+  ext.amg_uuid AS amgid
 
-FROM subscriber_ids;
+FROM gold_us_prod.consumer_dw.d_email_extd ext
+
+INNER JOIN active_subs s
+  ON ext.email_md5_hash = s.email_md5_hash
+
+WHERE ext.amg_uuid IS NOT NULL;
 
 
 -- ============================================================
--- STEP 3: Remove subscribers who are no longer active
---
--- This only removes people who are already represented in the
--- engagement table but are no longer current subscribers.
+-- STEP 3: Remove people who are no longer current subscribers
 -- ============================================================
 
 DELETE FROM gold_us_prod.area_shared_analytics.subscribers_tny
@@ -107,19 +93,16 @@ WHERE amgid IS NOT NULL
 
 
 -- ============================================================
--- STEP 4: Pull web + mobile engagement from the last 3 days
+-- STEP 4: Get daily engaged subscribers
 --
--- IMPORTANT:
---   user.amgid is used to determine subscriber status.
---   amg_id_stitched is retained separately and is NOT used
---   as the subscriber join key.
+-- WEB:
+--   One row per subscriber per day
+--
+-- MOBILE:
+--   One row per subscriber per day
 -- ============================================================
 
-WITH pvs AS (
-
-    -- --------------------------------------------------------
-    -- Web page views
-    -- --------------------------------------------------------
+WITH web_daily AS (
 
     SELECT
 
@@ -127,9 +110,9 @@ WITH pvs AS (
 
       user.amgid AS amgid,
 
-      user.amg_id_stitched AS amgid_stitched,
+      MAX(user.amg_id_stitched) AS amgid_stitched,
 
-      user.xid AS xid,
+      MAX(user.xid) AS xid,
 
       'web' AS source
 
@@ -147,13 +130,13 @@ WITH pvs AS (
 
       AND domain_userid IS NOT NULL
 
+    GROUP BY
+      start_tstamp_date,
+      user.amgid
+),
 
-    UNION ALL
 
-
-    -- --------------------------------------------------------
-    -- Mobile screen views
-    -- --------------------------------------------------------
+mobile_daily AS (
 
     SELECT
 
@@ -175,41 +158,52 @@ WITH pvs AS (
       AND app_id = 'the-new-yorker-app'
 
       AND user.amg_id IS NOT NULL
+
+    GROUP BY
+      derived_tstamp_date,
+      user.amg_id
+),
+
+
+daily_engagement AS (
+
+    SELECT * FROM web_daily
+
+    UNION ALL
+
+    SELECT * FROM mobile_daily
 ),
 
 
 -- ============================================================
--- STEP 5: Keep only visits belonging to current subscribers
+-- STEP 5: Keep only currently subscribed users
 -- ============================================================
 
 new_rows AS (
 
-    SELECT DISTINCT
+    SELECT
 
-      p.visit_date,
+      d.visit_date,
 
       'current subscriber' AS entitlement_status,
 
-      p.source,
+      d.source,
 
-      p.amgid,
+      d.amgid,
 
-      p.amgid_stitched,
+      d.amgid_stitched,
 
-      p.xid
+      d.xid
 
-    FROM pvs p
+    FROM daily_engagement d
 
     INNER JOIN current_subscribers cs
-      ON p.amgid = cs.amgid
+      ON d.amgid = cs.amgid
 )
 
 
 -- ============================================================
--- STEP 6: Add new engagement rows
---
--- The MERGE prevents the same visit record from being inserted
--- multiple times because of the 3-day lookback.
+-- STEP 6: Insert one row per subscriber / date / source
 -- ============================================================
 
 MERGE INTO gold_us_prod.area_shared_analytics.subscribers_tny t
@@ -221,10 +215,6 @@ ON t.visit_date = s.visit_date
    AND t.amgid = s.amgid
 
    AND t.source = s.source
-
-   AND t.amgid_stitched <=> s.amgid_stitched
-
-   AND t.xid <=> s.xid
 
 WHEN NOT MATCHED THEN
 
