@@ -1,129 +1,247 @@
-SET
-  ansi_mode = false;
+SET ansi_mode = false;
+
+
+-- ============================================================
+-- STEP 1: Create table if it does not already exist
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS gold_us_prod.area_shared_analytics.subscribers_tny (
+
+  visit_date DATE,
+  entitlement_status STRING,
+  source STRING,
+  amgid STRING,
+  amgid_stitched STRING,
+  xid STRING
+
+);
+
+
+-- ============================================================
+-- STEP 2: Build the current active subscriber universe
+-- ============================================================
+
+CREATE OR REPLACE TEMP VIEW current_subscribers AS
 
 WITH cds AS (
+
     SELECT
-      core_brand_cd,
+
       email_md5_hash,
+
       order_expire_dt AS subscription_last_active_day,
+
       cancel_dt AS cancel_last_active_day,
-      rank() over (
-        PARTITION by email_md5_hash,
-        magazine_abbr,
-        order_expire_dt
-        ORDER BY
-          order_nbr DESC
+
+      RANK() OVER (
+        PARTITION BY email_md5_hash, magazine_abbr, order_expire_dt
+        ORDER BY order_nbr DESC
       ) AS order_count
-    FROM
-      gold_us_prod.consumer_dw.f_consumer_subscription_cds
+
+    FROM gold_us_prod.consumer_dw.f_consumer_subscription_cds
+
     WHERE brand_cd IN ('NYR', 'NYR3')
-  ),
-  single_subs AS (
-    SELECT
-      core_brand_cd,
-      email_md5_hash,
-      CASE
-        WHEN isnull(cancel_last_active_day) THEN subscription_last_active_day
-        ELSE cancel_last_active_day
-      END AS subscription_last_active_dt
-    FROM
-      cds
-    WHERE
-      order_count = 1
-      AND isnull(cancel_last_active_day)
-      AND subscription_last_active_day >= current_date
-    UNION ALL
-    SELECT
-      'NYR' AS core_brand_cd,
-      email_md5_hash,
-      IFNULL(sub_cancelled_dt, current_date) AS subscription_last_active_dt
-    FROM
-      gold_us_prod.consumer_dw.f_consumer_subscription_martech
-    WHERE
-      core_brand_cd IN ('TNY', 'NYR')
+),
+
+active_subs AS (
+
+    SELECT DISTINCT
+      email_md5_hash
+
+    FROM cds
+
+    WHERE order_count = 1
+      AND cancel_last_active_day IS NULL
+      AND subscription_last_active_day >= CURRENT_DATE
+
+    UNION
+
+    SELECT DISTINCT
+      email_md5_hash
+
+    FROM gold_us_prod.consumer_dw.f_consumer_subscription_martech
+
+    WHERE core_brand_cd IN ('TNY', 'NYR')
       AND sub_cancelled_dt IS NULL
-  ),
-  cglemails AS (
+),
+
+subscriber_ids AS (
+
+    SELECT DISTINCT
+      ext.amg_uuid AS amgid
+
+    FROM gold_us_prod.consumer_dw.d_email_extd ext
+
+    INNER JOIN active_subs s
+      ON ext.email_md5_hash = s.email_md5_hash
+
+    WHERE ext.amg_uuid IS NOT NULL
+)
+
+SELECT
+  amgid
+
+FROM subscriber_ids;
+
+
+-- ============================================================
+-- STEP 3: Remove subscribers who are no longer active
+--
+-- This only removes people who are already represented in the
+-- engagement table but are no longer current subscribers.
+-- ============================================================
+
+DELETE FROM gold_us_prod.area_shared_analytics.subscribers_tny
+
+WHERE amgid IS NOT NULL
+
+  AND NOT EXISTS (
+
+    SELECT 1
+
+    FROM current_subscribers cs
+
+    WHERE cs.amgid = subscribers_tny.amgid
+
+  );
+
+
+-- ============================================================
+-- STEP 4: Pull web + mobile engagement from the last 3 days
+--
+-- IMPORTANT:
+--   user.amgid is used to determine subscriber status.
+--   amg_id_stitched is retained separately and is NOT used
+--   as the subscriber join key.
+-- ============================================================
+
+WITH pvs AS (
+
+    -- --------------------------------------------------------
+    -- Web page views
+    -- --------------------------------------------------------
+
     SELECT
-      ext.amg_uuid AS amg_id,
-      ext.email_md5_hash
-    FROM
-      gold_us_prod.consumer_dw.d_email_extd ext
-    WHERE
-      ext.amg_uuid IS NOT NULL
-      AND ext.email_md5_hash IS NOT NULL
-  ),
-  known_map AS (
-    SELECT
-      c.amg_id,
-      MAX(s.subscription_last_active_dt) AS subscription_last_active_dt
-    FROM
-      cglemails c
-      LEFT JOIN single_subs s ON c.email_md5_hash = s.email_md5_hash
-    GROUP BY
-      c.amg_id
-  ),
-  pvs AS (
-    -- Web page views (last 3 days)
-    SELECT
+
       start_tstamp_date AS visit_date,
-      COALESCE(user.amg_id_stitched, user.amgid) AS amg_id,
-      user.amg_id_stitched AS amg_id_stitched,
+
+      user.amgid AS amgid,
+
+      user.amg_id_stitched AS amgid_stitched,
+
       user.xid AS xid,
+
       'web' AS source
-    FROM
-      gold_us_prod.spruce.gld_web_page_views
-    WHERE
-      start_tstamp_date BETWEEN current_date - 3 AND dateadd(current_date, -1)
-      AND app_id IN ('the-new-yorker', 'the-new-yorker-app')
-      AND isnotnull(COALESCE(user.amg_id_stitched, user.amgid))
-      AND isnotnull(domain_userid)
+
+    FROM gold_us_prod.spruce.gld_web_page_views
+
+    WHERE start_tstamp_date BETWEEN CURRENT_DATE - 3
+                                AND CURRENT_DATE - 1
+
+      AND app_id IN (
+        'the-new-yorker',
+        'the-new-yorker-app'
+      )
+
+      AND user.amgid IS NOT NULL
+
+      AND domain_userid IS NOT NULL
+
 
     UNION ALL
 
-    -- Mobile screen views (last 3 days)
+
+    -- --------------------------------------------------------
+    -- Mobile screen views
+    -- --------------------------------------------------------
+
     SELECT
+
       derived_tstamp_date AS visit_date,
-      user.amg_id AS amg_id,
-      NULL AS amg_id_stitched,
+
+      user.amg_id AS amgid,
+
+      NULL AS amgid_stitched,
+
       NULL AS xid,
+
       'mobile' AS source
-    FROM
-      gold_us_prod.spruce.gld_mobile_screen_views
-    WHERE
-      derived_tstamp_date BETWEEN current_date - 3 AND dateadd(current_date, -1)
+
+    FROM gold_us_prod.spruce.gld_mobile_screen_views
+
+    WHERE derived_tstamp_date BETWEEN CURRENT_DATE - 3
+                                  AND CURRENT_DATE - 1
+
       AND app_id = 'the-new-yorker-app'
-      AND isnotnull(user.amg_id)
-  ),
-  unagg AS (
-    SELECT
-      visit_date,
-      pvs.amg_id,
-      pvs.amg_id_stitched,
-      pvs.xid,
-      pvs.source,
-      CASE
-        WHEN subscription_last_active_dt IS NOT NULL THEN 'current subscriber'
-        ELSE 'not subscriber'
-      END AS entitlement_status
-    FROM
-      pvs
-      LEFT JOIN known_map km ON pvs.amg_id = km.amg_id
+
+      AND user.amg_id IS NOT NULL
+),
+
+
+-- ============================================================
+-- STEP 5: Keep only visits belonging to current subscribers
+-- ============================================================
+
+new_rows AS (
+
+    SELECT DISTINCT
+
+      p.visit_date,
+
+      'current subscriber' AS entitlement_status,
+
+      p.source,
+
+      p.amgid,
+
+      p.amgid_stitched,
+
+      p.xid
+
+    FROM pvs p
+
+    INNER JOIN current_subscribers cs
+      ON p.amgid = cs.amgid
+)
+
+
+-- ============================================================
+-- STEP 6: Add new engagement rows
+--
+-- The MERGE prevents the same visit record from being inserted
+-- multiple times because of the 3-day lookback.
+-- ============================================================
+
+MERGE INTO gold_us_prod.area_shared_analytics.subscribers_tny t
+
+USING new_rows s
+
+ON t.visit_date = s.visit_date
+
+   AND t.amgid = s.amgid
+
+   AND t.source = s.source
+
+   AND t.amgid_stitched <=> s.amgid_stitched
+
+   AND t.xid <=> s.xid
+
+WHEN NOT MATCHED THEN
+
+  INSERT (
+    visit_date,
+    entitlement_status,
+    source,
+    amgid,
+    amgid_stitched,
+    xid
   )
-SELECT
-  visit_date,
-  'current subscriber' AS entitlement_status,
-  source,
-  amg_id AS amgid,
-  amg_id_stitched AS amgid_stitched,
-  xid
-FROM
-  unagg
-WHERE
-  entitlement_status = 'current subscriber'
-GROUP BY
-  ALL
-WHERE
-  entitlement_status = 'current subscriber'
-GROUP BY
-  ALL
+
+  VALUES (
+    s.visit_date,
+    s.entitlement_status,
+    s.source,
+    s.amgid,
+    s.amgid_stitched,
+    s.xid
+  );
