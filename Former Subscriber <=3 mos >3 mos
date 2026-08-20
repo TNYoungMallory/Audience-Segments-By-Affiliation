@@ -1,105 +1,293 @@
-SET
-  ansi_mode = false;
+SET ansi_mode = false;
 
--- Identify former subscribers among web/mobile visitors and their entitlement status
--- (read-only version: no writes to the fact_tny_former_subscribers table)
+-- ============================================================
+-- Former subscribers currently active on The New Yorker
+--
+-- Refresh:
+--   Daily
+--
+-- Audience:
+--   - Former subscribers
+--   - NOT currently active subscribers
+--   - Active on web or app TODAY
+--
+-- Buckets:
+--   within 3 months
+--   more than 3 months
+-- ============================================================
+
+
+-- ============================================================
+-- STEP 1: Subscription records
+-- ============================================================
+
 WITH cds AS (
+
   SELECT
+
     core_brand_cd,
     email_md5_hash,
     order_expire_dt AS subscription_last_active_day,
     cancel_dt AS cancel_last_active_day,
-    rank() OVER (
-      PARTITION BY email_md5_hash, magazine_abbr, order_expire_dt
+
+    RANK() OVER (
+      PARTITION BY
+        email_md5_hash,
+        magazine_abbr,
+        order_expire_dt
       ORDER BY order_nbr DESC
     ) AS order_count
+
   FROM gold_us_prod.consumer_dw.f_consumer_subscription_cds
+
   WHERE brand_cd IN ('NYR', 'NYR3')
 ),
+
+
+-- ============================================================
+-- STEP 2: Determine subscription end date
+-- ============================================================
+
 single_subs AS (
+
   SELECT
+
     core_brand_cd,
     email_md5_hash,
+
     CASE
-      WHEN isnull(cancel_last_active_day) THEN subscription_last_active_day
+      WHEN isnull(cancel_last_active_day)
+        THEN subscription_last_active_day
       ELSE cancel_last_active_day
     END AS subscription_last_active_dt
+
   FROM cds
+
   WHERE order_count = 1
+
   UNION ALL
+
   SELECT
+
     'NYR' AS core_brand_cd,
     email_md5_hash,
-    IFNULL(sub_cancelled_dt, current_date) AS subscription_last_active_dt
+
+    sub_cancelled_dt AS subscription_last_active_dt
+
   FROM gold_us_prod.consumer_dw.f_consumer_subscription_martech
+
   WHERE core_brand_cd IN ('TNY', 'NYR')
 ),
+
+
+-- ============================================================
+-- STEP 3: Map email to AMG ID
+-- ============================================================
+
 cglemails AS (
-  SELECT ext.amg_uuid AS amg_id, ext.email_md5_hash
-  FROM gold_us_prod.consumer_dw.d_email_extd ext
-  WHERE ext.amg_uuid IS NOT NULL AND ext.email_md5_hash IS NOT NULL
-),
-known_map AS (
+
   SELECT
+
+    ext.amg_uuid AS amg_id,
+    ext.email_md5_hash
+
+  FROM gold_us_prod.consumer_dw.d_email_extd ext
+
+  WHERE ext.amg_uuid IS NOT NULL
+    AND ext.email_md5_hash IS NOT NULL
+),
+
+
+-- ============================================================
+-- STEP 4: Build subscription status by AMG ID
+--
+-- max_subscription_end_dt:
+--   Most recent known subscription end date
+--
+-- active_subscription:
+--   1 = subscription is still active
+--   0 = no currently active subscription
+-- ============================================================
+
+subscription_status AS (
+
+  SELECT
+
     c.amg_id,
-    MAX(s.subscription_last_active_dt) AS subscription_last_active_dt
+
+    MAX(
+      s.subscription_last_active_dt
+    ) AS max_subscription_end_dt,
+
+    MAX(
+      CASE
+        WHEN s.subscription_last_active_dt >= current_date
+          THEN 1
+        ELSE 0
+      END
+    ) AS active_subscription
+
   FROM cglemails c
-  LEFT JOIN single_subs s ON c.email_md5_hash = s.email_md5_hash
+
+  INNER JOIN single_subs s
+    ON c.email_md5_hash = s.email_md5_hash
+
   GROUP BY c.amg_id
 ),
-pvs AS (
-  -- Web page views (last 3 rolling calendar months)
+
+
+-- ============================================================
+-- STEP 5: Today's web activity
+-- ============================================================
+
+web_activity AS (
+
   SELECT
+
     start_tstamp_date AS visit_date,
-    COALESCE(user.amg_id_stitched, user.amgid) AS amg_id,
-    user.amg_id_stitched AS amg_id_stitched,
+
+    COALESCE(
+      user.amg_id_stitched,
+      user.amgid
+    ) AS amg_id,
+
+    user.xid AS xid,
+
     'web' AS source
+
   FROM gold_us_prod.spruce.gld_web_page_views
-  WHERE
-    start_tstamp_date >= ADD_MONTHS(DATE_TRUNC('month', CURRENT_DATE), -3)
-    AND start_tstamp_date < current_date
-    AND app_id IN ('the-new-yorker', 'the-new-yorker-app')
-    AND isnotnull(COALESCE(user.amg_id_stitched, user.amgid))
+
+  WHERE start_tstamp_date = current_date
+
+    AND app_id IN (
+      'the-new-yorker',
+      'the-new-yorker-app'
+    )
+
+    AND isnotnull(
+      COALESCE(
+        user.amg_id_stitched,
+        user.amgid
+      )
+    )
+
+
+
     AND isnotnull(domain_userid)
-  UNION ALL
-  -- Mobile screen views (last 3 rolling calendar months)
+),
+
+
+-- ============================================================
+-- STEP 6: Today's mobile/app activity
+-- ============================================================
+
+mobile_activity AS (
+
   SELECT
+
     derived_tstamp_date AS visit_date,
+
     user.amg_id AS amg_id,
-    NULL AS amg_id_stitched,
+
+    NULL AS xid,
+
     'mobile' AS source
+
   FROM gold_us_prod.spruce.gld_mobile_screen_views
-  WHERE
-    derived_tstamp_date >= ADD_MONTHS(DATE_TRUNC('month', CURRENT_DATE), -3)
-    AND derived_tstamp_date < current_date
+
+  WHERE derived_tstamp_date = current_date
+
     AND app_id = 'the-new-yorker-app'
+
     AND isnotnull(user.amg_id)
 ),
-unagg AS (
+
+
+-- ============================================================
+-- STEP 7: Combine today's activity
+-- ============================================================
+
+today_activity AS (
+
+  SELECT *
+  FROM web_activity
+
+  UNION ALL
+
+  SELECT *
+  FROM mobile_activity
+),
+
+
+-- ============================================================
+-- STEP 8: Classify active former subscribers
+--
+-- Explicitly suppress anyone with an active subscription.
+-- ============================================================
+
+classified AS (
+
   SELECT
-    pvs.amg_id,
-    pvs.amg_id_stitched,
-    pvs.source,
-    visit_date,
+
+    a.visit_date,
+    a.amg_id,
+    a.xid,
+    a.source,
+
     CASE
-      WHEN km.subscription_last_active_dt < visit_date
-        AND km.subscription_last_active_dt >= dateadd(month, -3, visit_date)
+
+      WHEN ss.max_subscription_end_dt < current_date
+        AND ss.max_subscription_end_dt >= dateadd(
+          month,
+          -3,
+          current_date
+        )
       THEN 'within 3 months'
-      WHEN km.subscription_last_active_dt < visit_date
-        AND km.subscription_last_active_dt < dateadd(month, -3, visit_date)
+
+      WHEN ss.max_subscription_end_dt < dateadd(
+        month,
+        -3,
+        current_date
+      )
       THEN 'more than 3 months'
-      ELSE 'not former subscriber'
+
+      ELSE NULL
+
     END AS entitlement_status
-  FROM pvs
-  LEFT JOIN known_map km ON pvs.amg_id = km.amg_id
+
+  FROM today_activity a
+
+  INNER JOIN subscription_status ss
+    ON a.amg_id = ss.amg_id
+
+  WHERE COALESCE(
+    ss.active_subscription,
+    0
+  ) = 0
 )
+
+
+-- ============================================================
+-- STEP 9: Final current-day audience
+-- ============================================================
+
 SELECT
+
+  entitlement_status,
+
+  source,
+
+  amg_id AS amgid,
+
+  MAX(xid) AS xid,
+
   MAX(visit_date) AS last_visit_date
+
+FROM classified
+
+WHERE entitlement_status IS NOT NULL
+
+GROUP BY
   entitlement_status,
   source,
-  amg_id AS amgid,
-  MAX(amg_id_stitched) AS amgid_stitched
-FROM unagg
-WHERE entitlement_status <> 'not former subscriber'
-GROUP BY ALL
-ORDER BY last_visit_date DESC
+  amg_id;
