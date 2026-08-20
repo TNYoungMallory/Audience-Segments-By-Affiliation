@@ -3,6 +3,16 @@ SET ansi_mode = false;
 
 -- ============================================================
 -- STEP 1: Create table if it does not already exist
+--
+-- Grain:
+--   1 row per subscriber (amgid)
+--   per visit_date
+--   per source
+--
+-- Historical rows are retained permanently.
+--
+-- amgid_stitched and xid are retained for downstream joins
+-- but do NOT define the grain.
 -- ============================================================
 
 CREATE TABLE IF NOT EXISTS gold_us_prod.area_shared_analytics.subscribers_tny (
@@ -19,6 +29,11 @@ CREATE TABLE IF NOT EXISTS gold_us_prod.area_shared_analytics.subscribers_tny (
 
 -- ============================================================
 -- STEP 2: Build current active subscriber universe
+--
+-- This universe is used ONLY to determine who is eligible
+-- to have new activity added during today's refresh.
+--
+-- It does NOT affect historical rows already in the table.
 -- ============================================================
 
 CREATE OR REPLACE TEMP VIEW current_subscribers AS
@@ -26,13 +41,20 @@ CREATE OR REPLACE TEMP VIEW current_subscribers AS
 WITH cds AS (
 
     SELECT
+
       email_md5_hash,
+
       order_expire_dt AS subscription_last_active_day,
+
       cancel_dt AS cancel_last_active_day,
 
       RANK() OVER (
-        PARTITION BY email_md5_hash, magazine_abbr, order_expire_dt
-        ORDER BY order_nbr DESC
+        PARTITION BY
+          email_md5_hash,
+          magazine_abbr,
+          order_expire_dt
+        ORDER BY
+          order_nbr DESC
       ) AS order_count
 
     FROM gold_us_prod.consumer_dw.f_consumer_subscription_cds
@@ -40,8 +62,10 @@ WITH cds AS (
     WHERE brand_cd IN ('NYR', 'NYR3')
 ),
 
+
 active_subs AS (
 
+    -- CDS subscribers
     SELECT DISTINCT
       email_md5_hash
 
@@ -53,6 +77,7 @@ active_subs AS (
 
     UNION
 
+    -- Martech subscribers
     SELECT DISTINCT
       email_md5_hash
 
@@ -62,7 +87,9 @@ active_subs AS (
       AND sub_cancelled_dt IS NULL
 )
 
+
 SELECT DISTINCT
+
   ext.amg_uuid AS amgid
 
 FROM gold_us_prod.consumer_dw.d_email_extd ext
@@ -74,35 +101,21 @@ WHERE ext.amg_uuid IS NOT NULL;
 
 
 -- ============================================================
--- STEP 3: Remove people who are no longer current subscribers
--- ============================================================
-
-DELETE FROM gold_us_prod.area_shared_analytics.subscribers_tny
-
-WHERE amgid IS NOT NULL
-
-  AND NOT EXISTS (
-
-    SELECT 1
-
-    FROM current_subscribers cs
-
-    WHERE cs.amgid = subscribers_tny.amgid
-
-  );
-
-
--- ============================================================
--- STEP 4: Get daily engaged subscribers
+-- STEP 3: Build daily engagement
 --
 -- WEB:
---   One row per subscriber per day
+--   One row per amgid + visit_date
 --
 -- MOBILE:
---   One row per subscriber per day
+--   One row per amgid + visit_date
+--
+-- The 3-day lookback allows the daily process to safely
+-- reprocess recent dates.
+--
+-- Historical rows already in the table are never deleted.
 -- ============================================================
 
-WITH web_daily AS (
+WITH web_ranked AS (
 
     SELECT
 
@@ -110,11 +123,20 @@ WITH web_daily AS (
 
       user.amgid AS amgid,
 
-      MAX(user.amg_id_stitched) AS amgid_stitched,
+      user.amg_id_stitched AS amgid_stitched,
 
-      MAX(user.xid) AS xid,
+      user.xid AS xid,
 
-      'web' AS source
+      ROW_NUMBER() OVER (
+
+        PARTITION BY
+          start_tstamp_date,
+          user.amgid
+
+        ORDER BY
+          start_tstamp DESC
+
+      ) AS rn
 
     FROM gold_us_prod.spruce.gld_web_page_views
 
@@ -129,10 +151,26 @@ WITH web_daily AS (
       AND user.amgid IS NOT NULL
 
       AND domain_userid IS NOT NULL
+),
 
-    GROUP BY
-      start_tstamp_date,
-      user.amgid
+
+web_daily AS (
+
+    SELECT
+
+      visit_date,
+
+      amgid,
+
+      amgid_stitched,
+
+      xid,
+
+      'web' AS source
+
+    FROM web_ranked
+
+    WHERE rn = 1
 ),
 
 
@@ -160,6 +198,7 @@ mobile_daily AS (
       AND user.amg_id IS NOT NULL
 
     GROUP BY
+
       derived_tstamp_date,
       user.amg_id
 ),
@@ -167,16 +206,37 @@ mobile_daily AS (
 
 daily_engagement AS (
 
-    SELECT * FROM web_daily
+    SELECT
+
+      visit_date,
+      amgid,
+      amgid_stitched,
+      xid,
+      source
+
+    FROM web_daily
 
     UNION ALL
 
-    SELECT * FROM mobile_daily
+    SELECT
+
+      visit_date,
+      amgid,
+      amgid_stitched,
+      xid,
+      source
+
+    FROM mobile_daily
 ),
 
 
 -- ============================================================
--- STEP 5: Keep only currently subscribed users
+-- STEP 4: Keep only engagement from CURRENT subscribers
+--
+-- This determines eligibility for NEW rows only.
+--
+-- If a subscriber later cancels or stops taking action,
+-- their existing historical rows remain in the table.
 -- ============================================================
 
 new_rows AS (
@@ -203,7 +263,20 @@ new_rows AS (
 
 
 -- ============================================================
--- STEP 6: Insert one row per subscriber / date / source
+-- STEP 5: Merge daily engagement into historical table
+--
+-- Grain:
+--   visit_date + amgid + source
+--
+-- If the row already exists:
+--   Update identifiers when a newer/better value is available.
+--
+-- If the row does not exist:
+--   Insert it.
+--
+-- IMPORTANT:
+--   There is intentionally NO DELETE step.
+--   Historical subscriber activity is retained permanently.
 -- ============================================================
 
 MERGE INTO gold_us_prod.area_shared_analytics.subscribers_tny t
@@ -215,6 +288,24 @@ ON t.visit_date = s.visit_date
    AND t.amgid = s.amgid
 
    AND t.source = s.source
+
+
+WHEN MATCHED THEN
+
+  UPDATE SET
+
+    t.amgid_stitched =
+      COALESCE(
+        s.amgid_stitched,
+        t.amgid_stitched
+      ),
+
+    t.xid =
+      COALESCE(
+        s.xid,
+        t.xid
+      )
+
 
 WHEN NOT MATCHED THEN
 
