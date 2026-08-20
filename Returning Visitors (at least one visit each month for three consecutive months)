@@ -1,177 +1,312 @@
 SET ansi_mode = false;
 
--- Step 1: Create table on first run (no-op after that)
-CREATE TABLE IF NOT EXISTS hive_metastore.default.returning_visitors_tny (
+-- ============================================================
+-- Step 1: Create table on first run
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS gold_us_prod.area_shared_analytics.returning_visitors_tny (
   visit_date DATE,
   entitlement_status STRING,
   source STRING,
-  amgid STRING,
-  amgid_stitched STRING,
   xid STRING
 );
 
--- Step 2: Remove users who no longer qualify as returning visitors
--- A returning visitor is anonymous (not logged in), not a subscriber, not in trial,
--- and has visited in 3 consecutive months with a streak ending in current or previous month.
-WITH active_sub_duids AS (
-    SELECT DISTINCT aim.domain_userid
-    FROM gold_us_prod.spruce.analytics_identity_map aim
-    INNER JOIN gold_us_prod.consumer_dw.d_email_extd ext
-      ON aim.amg_user_id = ext.amg_uuid
-    INNER JOIN gold_us_prod.consumer_dw.f_consumer_subscription_martech sub
-      ON sub.consumer_profile_key = ext.email_md5_hash
-     AND sub.brand_cd = 'NYR'
-     AND sub.sub_status IN ('active', 'in_trial', 'non_renewing')
-    WHERE aim.brand = 'The New Yorker'
-      AND aim.domain_userid IS NOT NULL
-      AND aim.amg_user_id IS NOT NULL
-),
-user_months AS (
-    SELECT DISTINCT
-      domain_userid AS user_id,
-      DATE_TRUNC('month', start_tstamp_date) AS month
-    FROM gold_us_prod.spruce.gld_web_page_views
-    WHERE domain_userid IS NOT NULL
-      AND app_id IN ('the-new-yorker', 'the-new-yorker-app')
-      AND user.amgid IS NULL
-      AND start_tstamp_date >= DATEADD(month, -4, current_date)
-      AND domain_userid NOT IN (SELECT domain_userid FROM active_sub_duids)
-    UNION ALL
-    SELECT DISTINCT
-      user.user_id AS user_id,
-      DATE_TRUNC('month', derived_tstamp_date) AS month
-    FROM gold_us_prod.spruce.gld_mobile_screen_views
-    WHERE app_id = 'the-new-yorker-app'
-      AND user.user_id IS NOT NULL
-      AND user.amg_id IS NULL
-      AND derived_tstamp_date >= DATEADD(month, -4, current_date)
-),
-returning_xids AS (
-    SELECT DISTINCT wpv.user_xid AS xid
-    FROM user_months cur
-    INNER JOIN user_months m1
-      ON m1.user_id = cur.user_id AND m1.month = DATEADD(month, -1, cur.month)
-    INNER JOIN user_months m2
-      ON m2.user_id = cur.user_id AND m2.month = DATEADD(month, -2, cur.month)
-    INNER JOIN (
-      SELECT DISTINCT domain_userid AS user_id, user.xid AS user_xid
-      FROM gold_us_prod.spruce.gld_web_page_views
-      WHERE app_id IN ('the-new-yorker', 'the-new-yorker-app')
-        AND user.xid IS NOT NULL
-        AND start_tstamp_date >= DATEADD(month, -4, current_date)
-    ) wpv ON wpv.user_id = cur.user_id
-    WHERE cur.month >= DATEADD(month, -1, DATE_TRUNC('month', current_date))
-)
-DELETE FROM hive_metastore.default.returning_visitors_tny
-WHERE xid IS NULL
-   OR xid NOT IN (SELECT xid FROM returning_xids WHERE xid IS NOT NULL);
 
--- Step 3: Add new returning visitor visits (3-day lookback; MERGE prevents duplicates)
+-- ============================================================
+-- Step 2: Subscriber exclusion universe
+-- Applies to BOTH web and mobile
+-- ============================================================
+
 WITH active_sub_duids AS (
-    SELECT DISTINCT aim.domain_userid
-    FROM gold_us_prod.spruce.analytics_identity_map aim
-    INNER JOIN gold_us_prod.consumer_dw.d_email_extd ext
-      ON aim.amg_user_id = ext.amg_uuid
-    INNER JOIN gold_us_prod.consumer_dw.f_consumer_subscription_martech sub
-      ON sub.consumer_profile_key = ext.email_md5_hash
-     AND sub.brand_cd = 'NYR'
-     AND sub.sub_status IN ('active', 'in_trial', 'non_renewing')
-    WHERE aim.brand = 'The New Yorker'
-      AND aim.domain_userid IS NOT NULL
-      AND aim.amg_user_id IS NOT NULL
+
+  SELECT DISTINCT
+    aim.domain_userid
+
+  FROM gold_us_prod.spruce.analytics_identity_map aim
+
+  INNER JOIN gold_us_prod.consumer_dw.d_email_extd ext
+    ON aim.amg_user_id = ext.amg_uuid
+
+  INNER JOIN gold_us_prod.consumer_dw.f_consumer_subscription_martech sub
+    ON sub.consumer_profile_key = ext.email_md5_hash
+    AND sub.brand_cd = 'NYR'
+    AND sub.sub_status IN (
+      'active',
+      'in_trial',
+      'non_renewing'
+    )
+
+  WHERE aim.brand = 'The New Yorker'
+    AND aim.domain_userid IS NOT NULL
 ),
+
+
+-- ============================================================
+-- Step 3: Daily visitors to evaluate
+--
+-- These are the visitors whose activity we are loading.
+-- ============================================================
+
 pvs AS (
-    -- Web page views (last 3 days)
-    SELECT
-      start_tstamp_date AS visit_date,
-      DATE_TRUNC('month', start_tstamp_date) AS month,
-      domain_userid AS user_id,
-      user.amg_id_stitched AS amg_id_stitched,
-      user.xid AS xid,
-      'web' AS source
-    FROM gold_us_prod.spruce.gld_web_page_views
-    WHERE start_tstamp_date BETWEEN current_date - 3 AND current_date - 1
-      AND domain_userid IS NOT NULL
-      AND app_id IN ('the-new-yorker', 'the-new-yorker-app')
-      AND user.amgid IS NULL
-      AND NOT (
-        lower(session.marketing_source) like '%jg%'
-        OR lower(session.marketing_source) like '%display%'
-        OR lower(session.marketing_medium) like '%display%'
-        OR LOWER(session.marketing_campaign) LIKE 'paid%'
-        OR LOWER(session.marketing_campaign) LIKE '%paid-revops%'
-        OR LOWER(session.marketing_campaign) LIKE 'tin_%'
-        OR LOWER(session.marketing_medium) LIKE 'paid%'
-        OR LOWER(session.referer_url_query) LIKE '%boosted%'
-        OR LOWER(session.referer_url_query) LIKE '%facebook-citizennet%'
-        OR LOWER(session.marketing_medium) LIKE 'cpc%'
+
+  -- WEB
+  SELECT
+    start_tstamp_date AS visit_date,
+    domain_userid AS user_id,
+    user.xid AS xid,
+    'web' AS source
+
+  FROM gold_us_prod.spruce.gld_web_page_views
+
+  WHERE start_tstamp_date BETWEEN
+        current_date - 3
+        AND current_date - 1
+
+    AND domain_userid IS NOT NULL
+
+    AND app_id IN (
+      'the-new-yorker',
+      'the-new-yorker-app'
+    )
+
+    AND user.amgid IS NULL
+
+    -- Exclude paid traffic
+    AND NOT (
+      lower(session.marketing_source) LIKE '%jg%'
+      OR lower(session.marketing_source) LIKE '%display%'
+      OR lower(session.marketing_medium) LIKE '%display%'
+      OR lower(session.marketing_campaign) LIKE 'paid%'
+      OR lower(session.marketing_campaign) LIKE '%paid-revops%'
+      OR lower(session.marketing_campaign) LIKE 'tin_%'
+      OR lower(session.marketing_medium) LIKE 'paid%'
+      OR lower(session.referer_url_query) LIKE '%boosted%'
+      OR lower(session.referer_url_query) LIKE '%facebook-citizennet%'
+      OR lower(session.marketing_medium) LIKE 'cpc%'
+    )
+
+    AND domain_userid NOT IN (
+      SELECT domain_userid
+      FROM active_sub_duids
+    )
+
+
+  UNION ALL
+
+
+  -- MOBILE
+  SELECT
+    derived_tstamp_date AS visit_date,
+    user.user_id AS user_id,
+    CAST(NULL AS STRING) AS xid,
+    'mobile' AS source
+
+  FROM gold_us_prod.spruce.gld_mobile_screen_views
+
+  WHERE derived_tstamp_date BETWEEN
+        current_date - 3
+        AND current_date - 1
+
+    AND app_id = 'the-new-yorker-app'
+
+    AND user.user_id IS NOT NULL
+
+    -- Exclude subscribers from mobile
+    AND user.user_id NOT IN (
+      SELECT domain_userid
+      FROM active_sub_duids
+    )
+
+    -- Exclude paid traffic
+    AND NOT (
+      traffic.source_channel_group IN (
+        'Paid Social',
+        'Paid Search'
       )
-      AND domain_userid NOT IN (SELECT domain_userid FROM active_sub_duids)
-    UNION ALL
-    -- Mobile screen views (last 3 days)
-    SELECT
-      derived_tstamp_date AS visit_date,
-      DATE_TRUNC('month', derived_tstamp_date) AS month,
-      user.user_id AS user_id,
-      CAST(NULL AS STRING) AS amg_id_stitched,
-      CAST(NULL AS STRING) AS xid,
-      'mobile' AS source
-    FROM gold_us_prod.spruce.gld_mobile_screen_views
-    WHERE derived_tstamp_date BETWEEN current_date - 3 AND current_date - 1
-      AND app_id = 'the-new-yorker-app'
-      AND user.user_id IS NOT NULL
-      AND user.amg_id IS NULL
-      AND NOT (
-        traffic.source_channel_group IN ('Paid Social', 'Paid Search')
-        OR LOWER(traffic.marketing_campaign) LIKE 'paid%'
-        OR LOWER(traffic.referrer_medium) LIKE '%display%'
-      )
+      OR lower(traffic.marketing_campaign) LIKE 'paid%'
+      OR lower(traffic.referrer_medium) LIKE '%display%'
+    )
 ),
--- Check if user qualifies as returning visitor (3 consecutive months)
-user_months AS (
-    SELECT DISTINCT domain_userid AS user_id,
-      DATE_TRUNC('month', start_tstamp_date) AS month
-    FROM gold_us_prod.spruce.gld_web_page_views
-    WHERE app_id IN ('the-new-yorker', 'the-new-yorker-app')
-      AND domain_userid IS NOT NULL
-      AND user.amgid IS NULL
-      AND start_tstamp_date >= DATEADD(month, -4, current_date)
-      AND domain_userid NOT IN (SELECT domain_userid FROM active_sub_duids)
-    UNION ALL
-    SELECT DISTINCT user.user_id AS user_id,
-      DATE_TRUNC('month', derived_tstamp_date) AS month
-    FROM gold_us_prod.spruce.gld_mobile_screen_views
-    WHERE app_id = 'the-new-yorker-app'
-      AND user.user_id IS NOT NULL
-      AND user.amg_id IS NULL
-      AND derived_tstamp_date >= DATEADD(month, -4, current_date)
+
+
+-- ============================================================
+-- Step 4: Build visitor activity history
+--
+-- We pull 90 days BEFORE the earliest visit_date we are
+-- evaluating, plus the visit date itself.
+--
+-- This gives us enough history to evaluate each visit_date
+-- independently.
+-- ============================================================
+
+visitor_activity AS (
+
+  -- WEB
+  SELECT DISTINCT
+    domain_userid AS user_id,
+    start_tstamp_date AS activity_date,
+    DATE_TRUNC(
+      'month',
+      start_tstamp_date
+    ) AS activity_month
+
+  FROM gold_us_prod.spruce.gld_web_page_views
+
+  WHERE start_tstamp_date BETWEEN
+        (
+          SELECT MIN(visit_date)
+          FROM pvs
+        ) - 89
+        AND (
+          SELECT MAX(visit_date)
+          FROM pvs
+        )
+
+    AND domain_userid IS NOT NULL
+
+    AND app_id IN (
+      'the-new-yorker',
+      'the-new-yorker-app'
+    )
+
+    AND domain_userid NOT IN (
+      SELECT domain_userid
+      FROM active_sub_duids
+    )
+
+
+  UNION
+
+
+  -- MOBILE
+  SELECT DISTINCT
+    user.user_id AS user_id,
+    derived_tstamp_date AS activity_date,
+    DATE_TRUNC(
+      'month',
+      derived_tstamp_date
+    ) AS activity_month
+
+  FROM gold_us_prod.spruce.gld_mobile_screen_views
+
+  WHERE derived_tstamp_date BETWEEN
+        (
+          SELECT MIN(visit_date)
+          FROM pvs
+        ) - 89
+        AND (
+          SELECT MAX(visit_date)
+          FROM pvs
+        )
+
+    AND user.user_id IS NOT NULL
+
+    AND app_id = 'the-new-yorker-app'
+
+    AND user.user_id NOT IN (
+      SELECT domain_userid
+      FROM active_sub_duids
+    )
 ),
-returning_3mo AS (
-    SELECT cur.user_id, cur.month
-    FROM user_months cur
-    INNER JOIN user_months m1
-      ON m1.user_id = cur.user_id AND m1.month = DATEADD(month, -1, cur.month)
-    INNER JOIN user_months m2
-      ON m2.user_id = cur.user_id AND m2.month = DATEADD(month, -2, cur.month)
-),
-new_rows AS (
-    SELECT
-      pvs.visit_date,
-      'returning visitor' AS entitlement_status,
-      pvs.source,
-      CAST(NULL AS STRING) AS amgid,
-      MAX(pvs.amg_id_stitched) AS amgid_stitched,
-      MAX(pvs.xid) AS xid
+
+
+-- ============================================================
+-- Step 5: Determine whether each daily visitor qualifies
+--
+-- For EACH visit_date:
+--
+--   visit_date - 89 days
+--          through
+--   visit_date
+--
+-- must contain activity in >= 3 distinct calendar months.
+--
+-- Example:
+-- August 18 visit
+-- → May 21 through August 18
+-- → must have activity in 3+ distinct months
+-- ============================================================
+
+returning_visitors AS (
+
+  SELECT
+    p.user_id,
+    p.visit_date
+
+  FROM (
+    SELECT DISTINCT
+      user_id,
+      visit_date
     FROM pvs
-    INNER JOIN returning_3mo r
-      ON r.user_id = pvs.user_id AND r.month = pvs.month
-    GROUP BY pvs.visit_date, pvs.user_id, pvs.source
+  ) p
+
+  INNER JOIN visitor_activity a
+    ON a.user_id = p.user_id
+    AND a.activity_date BETWEEN
+        p.visit_date - 89
+        AND p.visit_date
+
+  GROUP BY
+    p.user_id,
+    p.visit_date
+
+  HAVING COUNT(
+    DISTINCT a.activity_month
+  ) >= 3
+),
+
+
+-- ============================================================
+-- Step 6: Keep qualifying daily activity
+-- ============================================================
+
+new_rows AS (
+
+  SELECT
+    p.visit_date,
+    'returning visitor' AS entitlement_status,
+    p.source,
+    MAX(p.xid) AS xid
+
+  FROM pvs p
+
+  INNER JOIN returning_visitors r
+    ON r.user_id = p.user_id
+    AND r.visit_date = p.visit_date
+
+  GROUP BY
+    p.visit_date,
+    p.user_id,
+    p.source
 )
-MERGE INTO hive_metastore.default.returning_visitors_tny t
+
+
+-- ============================================================
+-- Step 7: Insert new records without duplicates
+-- ============================================================
+
+MERGE INTO gold_us_prod.area_shared_analytics.returning_visitors_tny t
+
 USING new_rows s
+
 ON t.visit_date = s.visit_date
    AND t.source = s.source
-   AND (t.amgid <=> s.amgid)
-   AND (t.amgid_stitched <=> s.amgid_stitched)
-   AND (t.xid <=> s.xid)
-WHEN NOT MATCHED THEN INSERT *
+   AND (
+     t.xid <=> s.xid
+   )
+
+WHEN NOT MATCHED THEN
+
+  INSERT (
+    visit_date,
+    entitlement_status,
+    source,
+    xid
+  )
+
+  VALUES (
+    s.visit_date,
+    s.entitlement_status,
+    s.source,
+    s.xid
+  );
