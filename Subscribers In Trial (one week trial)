@@ -1,96 +1,111 @@
-SET
-  ansi_mode = false;
+SET ansi_mode = false;
 
+-- Step 1: Create table on first run
+CREATE TABLE IF NOT EXISTS gold_us_prod.area_shared_analytics.subscribers_in_trial_tny (
+  visit_date DATE,
+  entitlement_status STRING,
+  source STRING,
+  amgid STRING,
+  amgid_stitched STRING,
+  xid STRING
+);
+
+-- Step 2: Identify subscribers who are CURRENTLY in trial
 WITH trial_subs AS (
-  -- Users with trial subscriptions from martech
-  SELECT
-    email_md5_hash,
-    trial_start_dt,
-    trial_end_dt
-  FROM
-    gold_us_prod.consumer_dw.f_consumer_subscription_martech
-  WHERE
-    core_brand_cd IN ('TNY', 'NYR')
-    AND trial_start_dt IS NOT NULL
-    AND trial_end_dt IS NOT NULL
-    AND trial_end_dt >= current_date
+    SELECT
+      email_md5_hash,
+      trial_start_dt,
+      trial_end_dt
+    FROM gold_us_prod.consumer_dw.f_consumer_subscription_martech
+    WHERE core_brand_cd IN ('TNY', 'NYR')
+      AND trial_start_dt IS NOT NULL
+      AND trial_end_dt IS NOT NULL
+      AND trial_start_dt <= current_date
+      AND trial_end_dt >= current_date
 ),
+
+-- Step 3: Map email to AMG ID
 cglemails AS (
-  -- amg_id from page views maps directly to d_email_extd.amg_uuid
-  SELECT
-    ext.amg_uuid AS amg_id,
-    ext.email_md5_hash
-  FROM
-    gold_us_prod.consumer_dw.d_email_extd ext
-  WHERE
-    ext.amg_uuid IS NOT NULL
-    AND ext.email_md5_hash IS NOT NULL
+    SELECT
+      ext.amg_uuid AS amg_id,
+      ext.email_md5_hash
+    FROM gold_us_prod.consumer_dw.d_email_extd ext
+    WHERE ext.amg_uuid IS NOT NULL
+      AND ext.email_md5_hash IS NOT NULL
 ),
+
+-- Step 4: Map currently active trials to AMG IDs
 trial_map AS (
-  -- Map amg_id to trial periods
-  SELECT
-    c.amg_id,
-    t.trial_start_dt,
-    t.trial_end_dt
-  FROM
-    cglemails c
-    INNER JOIN trial_subs t ON c.email_md5_hash = t.email_md5_hash
+    SELECT DISTINCT
+      c.amg_id,
+      t.trial_start_dt,
+      t.trial_end_dt
+    FROM cglemails c
+    INNER JOIN trial_subs t
+      ON c.email_md5_hash = t.email_md5_hash
 ),
+
+-- Step 5: Pull recent site/app activity
 pvs AS (
-  -- Web page views
-  SELECT
-    start_tstamp_date AS visit_date,
-    COALESCE(user.amg_id_stitched, user.amgid) AS amg_id,
-    user.amg_id_stitched AS amg_id_stitched,
-    user.xid AS xid,
-    'web' AS source
-  FROM
-    gold_us_prod.spruce.gld_web_page_views
-  WHERE
-    start_tstamp_date <= dateadd(current_date, -1)
-    AND app_id IN ('the-new-yorker', 'the-new-yorker-app')
-    AND isnotnull(COALESCE(user.amg_id_stitched, user.amgid))
-    AND isnotnull(domain_userid)
 
-  UNION ALL
+    -- Web page views
+    SELECT
+      start_tstamp_date AS visit_date,
+      user.amg_id_stitched AS amg_id,
+      user.amg_id_stitched AS amg_id_stitched,
+      user.xid AS xid,
+      'web' AS source
+    FROM gold_us_prod.spruce.gld_web_page_views
+    WHERE start_tstamp_date BETWEEN current_date - 3 AND current_date - 1
+      AND app_id = 'the-new-yorker'
+      AND isnotnull(user.amg_id_stitched)
+      AND isnotnull(domain_userid)
 
-  -- Mobile screen views
-  SELECT
-    derived_tstamp_date AS visit_date,
-    user.amg_id AS amg_id,
-    NULL AS amg_id_stitched,
-    NULL AS xid,
-    'mobile' AS source
-  FROM
-    gold_us_prod.spruce.gld_mobile_screen_views
-  WHERE
-    derived_tstamp_date <= dateadd(current_date, -1)
-    AND app_id = 'the-new-yorker-app'
-    AND isnotnull(user.amg_id)
+    UNION ALL
+
+    -- Mobile screen views
+    SELECT
+      derived_tstamp_date AS visit_date,
+      user.amg_id_stitched AS amg_id,
+      user.amg_id_stitched AS amg_id_stitched,
+      NULL AS xid,
+      'mobile' AS source
+    FROM gold_us_prod.spruce.gld_mobile_screen_views
+    WHERE derived_tstamp_date BETWEEN current_date - 3 AND current_date - 1
+      AND app_id = 'the-new-yorker-app'
+      AND isnotnull(user.amg_id_stitched)
 ),
-unagg AS (
-  -- Only keep page views where the user was in their trial period
-  SELECT
-    pvs.visit_date,
-    pvs.amg_id,
-    pvs.amg_id_stitched,
-    pvs.xid,
-    pvs.source
-  FROM
-    pvs
+
+-- Step 6: Keep only activity from people
+-- who are currently in trial AND whose visit
+-- occurred during their trial period
+new_rows AS (
+    SELECT
+      p.visit_date,
+      'in trial' AS entitlement_status,
+      p.source,
+      p.amg_id AS amgid,
+      p.amg_id_stitched AS amgid_stitched,
+      p.xid
+    FROM pvs p
     INNER JOIN trial_map tm
-      ON pvs.amg_id = tm.amg_id
-      AND pvs.visit_date >= DATE(tm.trial_start_dt)
-      AND pvs.visit_date <= DATE(tm.trial_end_dt)
+      ON p.amg_id = tm.amg_id
+      AND p.visit_date >= DATE(tm.trial_start_dt)
+      AND p.visit_date <= DATE(tm.trial_end_dt)
+    GROUP BY ALL
 )
-SELECT
-  visit_date,
-  'in trial' AS entitlement_status,
-  source,
-  amg_id AS amgid,
-  amg_id_stitched AS amgid_stitched,
-  xid
-FROM
-  unagg
-GROUP BY
-  ALL
+
+-- Step 7: Append new qualifying activity
+-- Historical rows are NEVER deleted
+MERGE INTO gold_us_prod.area_shared_analytics.subscribers_in_trial_tny t
+
+USING new_rows s
+
+ON t.visit_date = s.visit_date
+   AND t.amgid = s.amgid
+   AND t.source = s.source
+   AND (t.amgid_stitched <=> s.amgid_stitched)
+   AND (t.xid <=> s.xid)
+
+WHEN NOT MATCHED THEN
+  INSERT *;
